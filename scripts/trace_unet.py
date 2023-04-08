@@ -19,6 +19,7 @@ class DDPM(nn.Module):
         super().__init__()
         self.model = model
 
+    @autocast('cuda')
     @torch.no_grad()
     def diffusion_model_1(self, img, condition, unconditional_condition, t, t_prev):
         x_in = torch.cat([img] * 2)
@@ -31,23 +32,30 @@ class DDPM(nn.Module):
         img = self.model.predict_start_from_z_and_v(pred_x0, t_prev, e_t)
         return img
     
+    @autocast('cuda')
     @torch.no_grad()
     def diffusion_model(self, x_in, t_in, condition_in):
-        print(self.model.model.diffusion_model.use_checkpoint)
         return self.model.model.diffusion_model(x_in, t_in, condition_in)
-
+    
+    @autocast('cuda')
+    @torch.no_grad()
+    def forward(self, x):
+        return x
+    
+    @autocast('cuda')
     @torch.no_grad()
     def predict_eps_from_z_and_v(self, z, t, v):
         return self.model.predict_eps_from_z_and_v(z, t, v)
     
+    @autocast('cuda')
     @torch.no_grad()
     def predict_start_from_z_and_v(self, z, t, v):
         return self.model.predict_start_from_z_and_v(z, t, v)
     
+    @autocast('cuda')
     @torch.no_grad()
     def q_sample(self, z, t, v):
         return self.model.q_sample(z, t, v)
-    
 
     @torch.no_grad()
     def decode_image(self, img):
@@ -58,7 +66,7 @@ class DDPM(nn.Module):
         encode = self.model.cond_stage_model.encode_with_transformer(tokens)
         return encode
 
-class DDPMDecoder(nn.Module):
+class AutoencoderKL(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
@@ -66,40 +74,56 @@ class DDPMDecoder(nn.Module):
     @autocast('cuda')
     @torch.no_grad()
     def forward(self, img):
-        return self.model.decode_first_stage(img)
+        return self.model.decode(img)
 
+class ClipEncoder(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    @autocast('cuda')
+    @torch.no_grad()
+    def forward(self, tokens):
+        return self.model.encode_with_transformer(tokens)
+    
 def main(opt):
     torch.set_grad_enabled(False)
     seed_everything(42)
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
     model = load_model_from_config(config, f"{opt.ckpt}", device=device, verbose=True)
-    print(model.model.diffusion_model.use_checkpoint)
+    autoklencoder = AutoencoderKL(model.first_stage_model)
+    clipEncoder = ClipEncoder(model.cond_stage_model)
+    model.first_stage_model = None
+    model.cond_stage_model = None
     scale = 9.0
     sampler = DDPM(model)
-    with torch.no_grad(), autocast('cuda'):
-        img_in = torch.ones(opt.batch, 4, 96, 96, dtype=torch.float32, device = device)
-        t_in = torch.ones(opt.batch, dtype=torch.int64, device = device)
+    with torch.no_grad():
+        img_in = torch.ones(2, 4, 96, 96, dtype=torch.float32, device = device)
+        t_in = torch.ones(2, dtype=torch.int64, device = device)
         t_prev = torch.ones(opt.batch, dtype=torch.int64, device = device)
-        context = torch.ones(opt.batch, 77, 1024, dtype=torch.float32, device = device)
+        context = torch.ones(2, 77, 1024, dtype=torch.float32, device = device)
         tokens = torch.ones((opt.batch, 77), dtype=torch.int64, device = device)
         uncondition_context = torch.ones(opt.batch, 77, 1024, dtype=torch.float32, device = device)
         input = {
-            'diffusion_model': (torch.cat([img_in]),torch.cat([t_in]), torch.cat([context])),
-            # 'decode_image': (img_in, ),
-            # 'clip_encoder': (tokens, ),
-            # 'predict_eps_from_z_and_v': (img_in, t_in, img_in),
-            # 'predict_start_from_z_and_v': (img_in, t_in, img_in),
-            # 'q_sample': (img_in, t_in, img_in),
+            'diffusion_model': (img_in,t_in, context),
+            #'decode_image': (img_in, ),
+            #'clip_encoder': (tokens, ),
+            'predict_eps_from_z_and_v': (img_in, t_in, img_in),
+            'predict_start_from_z_and_v': (img_in, t_in, img_in),
+            'q_sample': (img_in, t_in, img_in),
         }
         # scripted_sampler = sampler
         scripted_sampler = torch.jit.trace_module(sampler, input)
-        # scripted_sampler.save(f"{opt.output}/ddim_v_sampler.pt")
-
-        # # get Decoder for first stage model scripted
-        # samples_ddim = torch.randn(opt.batch, 4, 96, 96, device=device)
-        # scripted_decoder = torch.jit.trace(decoder, (samples_ddim))
-        # scripted_decoder.save(f"{opt.output}/decoder.pt")
+        samples_ddim = torch.randn(opt.batch, 4, 96, 96, device=device)
+        scripted_clip_encoder = torch.jit.trace(clipEncoder, (tokens))
+        scripted_decoder = torch.jit.trace(autoklencoder, (samples_ddim))
+        # scripted_sampler = torch.jit.optimize_for_inference(scripted_sampler, ['diffusion_model', 'predict_eps_from_z_and_v', 'predict_start_from_z_and_v', 'q_sample'])
+        # scripted_clip_encoder = torch.jit.optimize_for_inference(scripted_clip_encoder)
+        # scripted_decoder = torch.jit.optimize_for_inference(scripted_decoder)
+        scripted_sampler.save(f"{opt.output}/ddim_v_sampler.pt")
+        scripted_decoder.save(f"{opt.output}/decoder.pt")
+        scripted_clip_encoder.save(f"{opt.output}/clip_encoder.pt")
 
         n_step = 50
         timesteps = 1000
@@ -112,11 +136,11 @@ def main(opt):
         prompts = opt.batch * ["cute green dog"]
         tokens = open_clip.tokenize(prompts)
         tokens = tokens.to(device)
-        condition = scripted_sampler.clip_encoder(tokens)
+        condition = scripted_clip_encoder(tokens)
         unconditional_prompt = opt.batch * [""]
         unconditional_tokens = open_clip.tokenize(unconditional_prompt)
         unconditional_tokens = unconditional_tokens.to(device)
-        unconditional_condition = scripted_sampler.clip_encoder(unconditional_tokens)
+        unconditional_condition = scripted_clip_encoder(unconditional_tokens)
         for index, i in enumerate(reversed(ddim_timesteps)):
             index = n_step - index - 1
             t = torch.full((opt.batch,), i, dtype=torch.int64, device=device)
@@ -131,7 +155,7 @@ def main(opt):
             img = scripted_sampler.q_sample(pred_x0, t_prev, e_t)
             print(img.dtype)
 
-        decoded_images = scripted_sampler.decode_image(img)
+        decoded_images = scripted_decoder(img)
         decoded_images = torch.clamp((decoded_images + 1.0) / 2.0, 0.0, 1.0)
         outpath = opt.output
         base_count=0

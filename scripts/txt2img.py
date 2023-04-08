@@ -13,7 +13,7 @@ from torch import autocast
 from contextlib import nullcontext
 from imwatermark import WatermarkEncoder
 
-from ldm.util import instantiate_from_config
+from ldm.util import instantiate_from_config, load_model_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.dpm_solver import DPMSolverSampler
@@ -24,40 +24,13 @@ def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
 
-
-def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=False):
-    print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
-    model = instantiate_from_config(config.model)
-    m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print("missing keys:")
-        print(m)
-    if len(u) > 0 and verbose:
-        print("unexpected keys:")
-        print(u)
-
-    if device == torch.device("cuda"):
-        model.cuda()
-    elif device == torch.device("cpu"):
-        model.cpu()
-        model.cond_stage_model.device = "cpu"
-    else:
-        raise ValueError(f"Incorrect device name. Received: {device}")
-    model.eval()
-    return model
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--prompt",
         type=str,
         nargs="?",
-        default="a professional photograph of an astronaut riding a triceratops",
+        default="cute cat",
         help="the prompt to render"
     )
     parser.add_argument(
@@ -97,7 +70,7 @@ def parse_args():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=3,
+        default=1,
         help="sample this often",
     )
     parser.add_argument(
@@ -127,7 +100,7 @@ def parse_args():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a batch size",
     )
     parser.add_argument(
@@ -216,7 +189,7 @@ def main(opt):
 
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
-    model = load_model_from_config(config, f"{opt.ckpt}", device)
+    model = load_model_from_config(config, f"{opt.ckpt}", device, True)
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
